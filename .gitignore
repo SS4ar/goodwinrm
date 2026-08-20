@@ -1,3 +1,6 @@
 __pycache__/
 venv/
 env/
+.venv/
+._DS_Store
+GoodWinRM.egg-info
