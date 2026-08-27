@@ -207,11 +207,11 @@ def shell_ls(pattern, proto, shell_id, cdir):
     safe = cdir.replace('"', '""')
     if pattern:
         ps = ('Set-Location "%s"; Get-ChildItem -Force "%s" |'
-              ' Format-Table -AutoSize | Out-String -Width 4096 -Tail 9999'
+              ' Format-Table -AutoSize | Out-String -Width 4096'
               % (safe, pattern.replace('"', '')))
     else:
         ps = ('Set-Location "%s"; Get-ChildItem -Force |'
-              ' Format-Table -AutoSize | Out-String -Width 4096 -Tail 9999'
+              ' Format-Table -AutoSize | Out-String -Width 4096'
               % safe)
     out, _ = cmd_out(ps, proto, shell_id)
     if out:
@@ -224,7 +224,8 @@ def shell_cd(path, proto, shell_id, cdir):
     safe = path.replace('"', '""')
     cdir_safe = cdir.replace('"', '""')
     # Два Set-Location — первый из cdir, второй к цели. Работает для всех типов путей.
-    ps = '3>$null; Set-Location "%s" -EA Stop; Set-Location "%s" -EA Stop; $PWD' % (cdir_safe, safe)
+    # $PWD.Path — сам $PWD форматируется как таблица (PathInfo object)
+    ps = '3>$null; Set-Location "%s" -EA Stop; Set-Location "%s" -EA Stop; $PWD.Path' % (cdir_safe, safe)
     out, rc = cmd_out(ps, proto, shell_id)
     if rc != 0 or not out:
         print_error("Cannot cd to '%s'" % path)
