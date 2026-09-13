@@ -4,3 +4,4 @@ prompt-toolkit>=3.0.43
 pyspnego>=0.11.0
 cryptography>=42.0.0
 urllib3<2
+kerberos  # kerberos transport only; needs system MIT krb5 (brew install krb5 / libkrb5-dev)
