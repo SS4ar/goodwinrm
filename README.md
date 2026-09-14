@@ -14,7 +14,7 @@ Python WinRM Interactive Shell with file transfer support.
 ## Installation
 
 ```bash
-pipx install git+https://github.com/h3x0c4t/goodwinrm
+pipx install git+https://github.com/SS4ar/goodwinrm
 pipx ensurepath
 ```
 
@@ -34,6 +34,20 @@ goodwinrm -i 10.10.30.10 -u 'Administrator' --nt-hash 'A87E1E9015421162B6D958BBF
 ```bash
 export KRB5CCNAME=/tmp/admin.ccache
 goodwinrm -i dc.domain.local -u 'admin@DOMAIN.LOCAL' -t kerberos
+```
+
+Use the full client principal shown by `klist`, including the realm's exact
+capitalization. If the cache contains only a TGT, Kerberos must be able to locate
+and reach the KDC to obtain the target's HTTP service ticket.
+
+Kerberos message encryption requires `pykerberos`, installed by the
+`pywinrm[kerberos]` dependency. The separate `kerberos` package uses the same
+Python module name but lacks the required WinRM encryption support. If an older
+installation returns HTTP 500, repair its dependencies in the same environment:
+
+```bash
+pipx runpip goodwinrm uninstall -y kerberos pykerberos
+pipx runpip goodwinrm install 'pywinrm[kerberos]>=0.4.3'
 ```
 
 ## CLI Options

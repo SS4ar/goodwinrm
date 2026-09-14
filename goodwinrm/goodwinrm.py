@@ -108,6 +108,7 @@ def open_session(args):
             username=args.username,
             password=password,
             server_cert_validation=args.server_cert_validation,
+            message_encryption="always" if args.transport == "kerberos" and not args.https else "auto",
         )
         shell_id = proto.open_shell(codepage=65001, working_directory=args.directory)
         print_success("Authenticated to %s" % host)
