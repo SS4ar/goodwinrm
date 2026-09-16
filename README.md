@@ -36,6 +36,20 @@ export KRB5CCNAME=/tmp/admin.ccache
 goodwinrm -i dc.domain.local -u 'admin@DOMAIN.LOCAL' -t kerberos
 ```
 
+The default Kerberos service is `HTTP`. If your ccache contains only a service
+ticket for `HOST/server` or `WSMAN/server`, select that service explicitly,
+preserving the case shown by `klist`:
+
+```bash
+goodwinrm -i dc.domain.local -u 'admin@DOMAIN.LOCAL' -t kerberos --krb-service HOST
+# For a WSMAN ticket, use --krb-service WSMAN instead.
+```
+
+`Matching credential not found` can mean that the requested SPN does not match
+the cached ticket. Use `--krb-hostname` if the ticket's hostname differs from the
+connection address (for example, when connecting through a tunnel). These
+options select the requested SPN; the server must also accept the ticket.
+
 ## CLI Options
 
 | Flag                | Description                                   |
@@ -44,6 +58,8 @@ goodwinrm -i dc.domain.local -u 'admin@DOMAIN.LOCAL' -t kerberos
 | `-u`, `--username`  | Username (`DOMAIN\User` or `user@DOMAIN`)     |
 | `-p`, `--password`  | Password (empty for Kerberos ccache)          |
 | `--nt-hash`         | NT hash for Pass-The-Hash (`NT` or `LM:NT`)   |
+| `--krb-service`     | Kerberos SPN service (default `HTTP`; match the case in `klist`) |
+| `--krb-hostname`    | Kerberos SPN hostname override               |
 | `-t`, `--transport` | Auth transport: `ntlm` (default), `kerberos`, `credssp`, `basic`, `ssl`, `certificate` |
 | `--https`           | Use HTTPS (port 5986)                         |
 | `--port PORT`       | Custom port                                   |

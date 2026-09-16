@@ -8,7 +8,9 @@ from prompt_toolkit import print_formatted_text as printf, HTML, ANSI, PromptSes
 from prompt_toolkit.completion import WordCompleter
 from winrm.protocol import Protocol
 
-B64_CHUNK = 8192
+# Must keep the resulting `powershell -enc <b64>` command line under the
+# cmd.exe 8191-char limit: 8192-byte chunks blow past it and fail on >~2.2KB files.
+B64_CHUNK = 2048
 
 
 def print_error(msg):
@@ -67,6 +69,12 @@ Shell commands:
     parser.add_argument("-d", "--directory", default="C:\\", help="Working directory")
     parser.add_argument("--https", action="store_true", help="Use HTTPS")
     parser.add_argument("--port", type=int, default=0, help="Custom port")
+    parser.add_argument("--krb-hostname", default=None,
+                        help="Kerberos SPN hostname override (for tunnels/jump hosts). "
+                             "E.g. host reached at 127.0.0.1 but ticket is for exchange.naliway.local")
+    parser.add_argument("--krb-service", default=None,
+                        help="Kerberos SPN service (default: HTTP). "
+                             "Match the service and case shown by klist, e.g. HOST or WSMAN")
     return parser.parse_args()
 
 
@@ -101,6 +109,12 @@ def open_session(args):
             print_info("Kerberos auth — no KRB5CCNAME set, using default")
         password = ""
 
+    kwargs = {}
+    if args.krb_hostname:
+        kwargs["kerberos_hostname_override"] = args.krb_hostname
+    if args.krb_service:
+        kwargs["service"] = args.krb_service
+
     try:
         proto = Protocol(
             endpoint=endpoint,
@@ -108,6 +122,7 @@ def open_session(args):
             username=args.username,
             password=password,
             server_cert_validation=args.server_cert_validation,
+            **kwargs,
         )
         shell_id = proto.open_shell(codepage=65001, working_directory=args.directory)
         print_success("Authenticated to %s" % host)
@@ -119,6 +134,11 @@ def open_session(args):
             print_error("Authentication denied")
         else:
             print_error("Connection failed: %s" % err)
+        if args.transport == "kerberos" and "matching credential not found" in err.lower():
+            print_info("Requested Kerberos service: %s/%s. Check klist; "
+                       "use --krb-service to match the ticket's service and case "
+                       "(e.g. HOST or WSMAN), and --krb-hostname if the hostname differs."
+                       % (args.krb_service or "HTTP", args.krb_hostname or host))
         sys.exit(1)
 
 
@@ -158,8 +178,10 @@ def upload(local_path, remote_path, proto, shell_id):
             ps = ('$bt=[Convert]::FromBase64String("%s"); '
                   '[System.IO.File]::WriteAllBytes("%s",$bt)' % (b64chunk, remote_safe))
         else:
+            # System.IO.File has no AppendAllBytes; use FileStream in Append mode
             ps = ('$bt=[Convert]::FromBase64String("%s"); '
-                  '[System.IO.File]::AppendAllBytes("%s",$bt)' % (b64chunk, remote_safe))
+                  '$fs=[System.IO.File]::Open("%s",[System.IO.FileMode]::Append); '
+                  '$fs.Write($bt,0,$bt.Length); $fs.Close()' % (b64chunk, remote_safe))
 
         _, rc = cmd_out(ps, proto, shell_id)
         if rc != 0:
