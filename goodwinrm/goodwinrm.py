@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import time
 import threading
@@ -23,6 +24,34 @@ def print_success(msg):
 
 def print_info(msg):
     printf(ANSI("\x1b[36m⠿ %s\x1b[0m" % msg))
+
+
+def normalize_ccache_hostname(spn_host):
+    """krb5 lowercases the hostname part of the SPN before looking it up in the
+    ccache, and the lookup is case-sensitive. Rewrite any case variant of the
+    hostname inside the ccache file so the ticket always matches. Case-only
+    replacement keeps the byte length, so the length-prefixed ccache stays valid."""
+    ccache = os.environ.get("KRB5CCNAME", "")
+    if not ccache or not spn_host:
+        return
+    if ccache.upper().startswith("FILE:"):
+        ccache = ccache[5:]
+    if "://" in ccache or ccache.upper().startswith("DIR:"):
+        return
+    path = os.path.expanduser(ccache)
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        pattern = re.compile(re.escape(spn_host.encode()), re.IGNORECASE)
+        fixed = pattern.sub(spn_host.lower().encode(), data)
+        if fixed != data:
+            with open(path, "wb") as f:
+                f.write(fixed)
+            print_info("Normalized SPN host case in %s -> %s" % (path, spn_host.lower()))
+    except OSError:
+        pass
 
 
 def banner():
@@ -108,6 +137,10 @@ def open_session(args):
         else:
             print_info("Kerberos auth — no KRB5CCNAME set, using default")
         password = ""
+        if args.username and "@" in args.username:
+            user, _, realm = args.username.partition("@")
+            args.username = "%s@%s" % (user, realm.upper())
+        normalize_ccache_hostname(args.krb_hostname or host)
 
     kwargs = {}
     if args.krb_hostname:
