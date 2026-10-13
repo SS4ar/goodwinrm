@@ -10,6 +10,9 @@ Python WinRM Interactive Shell with file transfer support.
 - **Password, Pass-The-Hash, Kerberos ccachе auth**
 - **File upload / download** (evil-winrm style, base64 chunked)
 - Native `ls` / `cd` / `pwd` — preserved directory state per-process
+- Foreground `run`/`exec` of remote binaries with stdout, stderr, and exit code
+- Detached `spawn` that survives disconnect (`breakaway`, `wmi-native`, `wmi-ps`, `schtasks` launchers)
+- `runps` and multi-line `script` mode — run PowerShell without writing a `.ps1` on the target
 
 ## Installation
 
@@ -90,7 +93,54 @@ pipx runpip goodwinrm install 'pywinrm[kerberos]>=0.4.3'
 | `pwd`           | Print working directory              |
 | `upload local remote`  | Upload file (base64 chunked)   |
 | `download remote local` | Download file (base64 chunked) |
+| `run EXE [ARGS...]` | Execute a remote binary, report its exit code |
+| `exec EXE [ARGS...]` | Alias for `run`                 |
+| `spawn [OPTIONS] EXE [ARGS...]` | Launch a detached process that survives disconnect |
+| `runps LOCAL.ps1 [ARGS...]` | Run a local PowerShell script remotely |
+| `script` / `paste` | Multi-line mode: paste a script, end with a line containing only `.` |
 | `clear`         | Clear terminal                       |
 | `exit`          | Close session                        |
 
 Any other input is executed as a PowerShell command in the current working directory.
+
+## Running and Spawning Binaries
+
+`run` (alias `exec`) executes a remote binary in the foreground, prints its
+stdout and stderr, and reports the exit code without treating a nonzero code
+as a session error. Relative paths resolve against the current remote
+directory:
+
+```text
+run C:\Windows\System32\cmd.exe /c "echo run-ok & exit 7"
+run C:\Windows\System32\whoami.exe
+```
+
+`spawn` launches a detached process that keeps running after the WinRM session
+is closed or drops. With `--launcher auto` (default) the launcher order is
+`breakaway` → `wmi-native` → `wmi-ps`:
+
+```text
+spawn C:\Windows\Temp\tool.exe --flag arg
+spawn --launcher schtasks C:\Windows\Temp\tool.exe
+spawn --stage-dir C:\Windows\Temp --stdout C:\Windows\Temp\out.log C:\Windows\Temp\tool.exe
+```
+
+- `breakaway` / `wmi-native` stage a tiny native helper (no `goodwinrm` in its
+  random temporary filename) and do not redirect output;
+- `wmi-ps` creates the process through `Win32_Process` and supports
+  `--stdout` / `--stderr` redirection;
+- `schtasks` runs the binary through a one-shot SYSTEM scheduled task.
+
+## Running Multi-Line Scripts
+
+The interactive shell executes one input line per command, so multi-line
+scripts cannot be pasted directly. Use one of:
+
+- `runps LOCAL.ps1 [ARGS...]` — reads a **local** script and runs it remotely;
+- `script` (alias `paste`) — enters multi-line mode; paste the script and
+  finish with a line containing only `.`.
+
+Both send the whole text as a single encoded command wrapped in a script block,
+so a top-level `param(...)` is valid and a restrictive ExecutionPolicy (e.g.
+`AllSigned`) does not block it — no `.ps1` file is written on the target and
+`powershell -File` is not used.

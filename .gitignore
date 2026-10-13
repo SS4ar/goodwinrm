@@ -4,3 +4,5 @@ env/
 .venv/
 ._DS_Store
 GoodWinRM.egg-info
+# native launcher build artifacts (blobs are embedded in goodwinrm/_gwspawn.py)
+tools/*.exe
