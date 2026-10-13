@@ -8,6 +8,7 @@ import pytest
 
 import goodwinrm.goodwinrm as app
 from goodwinrm.goodwinrm import (
+    PS_PROGRESS_SILENCE,
     CommandResult,
     GoodWinRMError,
     WinRMShell,
@@ -66,7 +67,7 @@ def test_run_decodes_output_and_always_cleans_command() -> None:
     result = shell.run("Write-Output hello")
 
     assert result == CommandResult("hello", "plain error", 1)
-    assert protocol.scripts == ["Write-Output hello"]
+    assert protocol.scripts == [PS_PROGRESS_SILENCE + "Write-Output hello"]
     assert protocol.cleaned == ["command-1"]
 
 
@@ -91,7 +92,7 @@ def test_run_with_input_streams_chunks_and_closes_stdin() -> None:
     result = shell.run_with_input("read stdin", [b"one\n", b"two\n"])
 
     assert result == CommandResult("7", "", 0)
-    assert protocol.scripts == ["read stdin"]
+    assert protocol.scripts == [PS_PROGRESS_SILENCE + "read stdin"]
     assert protocol.inputs == [(b"one\n", False), (b"two\n", False), (b"", True)]
     assert protocol.cleaned == ["command-1"]
 
@@ -165,7 +166,7 @@ class StubShell:
         self.scripts.append(script)
         return self.results.pop(0) if self.results else CommandResult("", "", 0)
 
-    def start_keepalive(self) -> None:
+    def start_keepalive(self, interval: float = 45.0) -> None:
         self.keepalive_started = True
 
     def close(self) -> None:

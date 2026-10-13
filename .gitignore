@@ -12,3 +12,6 @@ env/
 htmlcov/
 build/
 dist/
+
+# native launcher build artifacts (blobs are embedded in goodwinrm/_gwspawn.py)
+tools/*.exe

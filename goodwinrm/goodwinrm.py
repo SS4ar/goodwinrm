@@ -25,6 +25,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.shortcuts import print_formatted_text
 from winrm.protocol import Protocol
 
+from ._gwspawn import GWSPAWN_X64_B64, GWSPAWN_X86_B64
+
 VERSION = "0.2.0"
 UPLOAD_CHUNK_SIZE = 48 * 1024
 DOWNLOAD_CHUNK_SIZE = 48 * 1024
@@ -32,6 +34,14 @@ ZERO_LM_HASH = "0" * 32
 NT_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 LM_NT_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}:[0-9a-fA-F]{32}$")
 TRANSPORTS = ("ntlm", "kerberos", "credssp", "basic", "plaintext", "ssl", "certificate")
+PS_PROGRESS_SILENCE = "$ProgressPreference='SilentlyContinue';"
+SPAWN_USAGE = (
+    "Usage: spawn [--launcher auto|breakaway|wmi-native|wmi-ps|schtasks] [--stage-dir DIR] "
+    "[--stdout PATH] [--stderr PATH] <remote executable> [arguments...]"
+)
+LAUNCHERS = ("auto", "breakaway", "wmi-native", "wmi-ps", "schtasks")
+HELPER_MODES = {"breakaway": "breakaway", "wmi-native": "wmi"}
+DEFAULT_STAGE_DIR = "C:\\Windows\\Temp"
 
 USE_COLOR = True
 
@@ -49,6 +59,17 @@ class CommandResult:
     stdout: str
     stderr: str
     status_code: int
+
+
+@dataclass(frozen=True)
+class SpawnRequest:
+    executable: str
+    arguments: tuple[str, ...]
+    stdout_path: str | None = None
+    stderr_path: str | None = None
+    use_schtasks: bool = False
+    launcher: str = "auto"
+    stage_dir: str | None = None
 
 
 def _message(symbol: str, color: str, message: str) -> None:
@@ -135,6 +156,17 @@ Quote paths containing spaces:
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     parser.add_argument(
         "--no-history", action="store_true", help="Disable persistent command history"
+    )
+    parser.add_argument(
+        "--no-keepalive",
+        action="store_true",
+        help="Disable background keepalive PowerShell commands",
+    )
+    parser.add_argument(
+        "--keepalive-interval",
+        type=float,
+        default=45.0,
+        help="Seconds between keepalive commands (0 disables keepalive)",
     )
     parser.add_argument("--version", action="version", version=f"GoodWinRM {VERSION}")
     return parser
@@ -277,7 +309,9 @@ class WinRMShell:
         self._closed = False
 
     def run(self, script: str) -> CommandResult:
-        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        encoded = base64.b64encode((PS_PROGRESS_SILENCE + script).encode("utf-16-le")).decode(
+            "ascii"
+        )
         command_id: str | None = None
         with self._lock:
             try:
@@ -309,7 +343,9 @@ class WinRMShell:
     def run_with_input(self, script: str, input_chunks: Iterable[bytes]) -> CommandResult:
         """Run PowerShell and stream ASCII-safe data to its standard input."""
 
-        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        encoded = base64.b64encode((PS_PROGRESS_SILENCE + script).encode("utf-16-le")).decode(
+            "ascii"
+        )
         command_id: str | None = None
         with self._lock:
             try:
@@ -338,6 +374,37 @@ class WinRMShell:
         return CommandResult(
             stdout=_decode_output(stdout),
             stderr=clean_powershell_error(stderr),
+            status_code=status_code,
+        )
+
+    def run_native(self, executable: str, arguments: Sequence[str]) -> CommandResult:
+        """Run a remote executable directly with quoted arguments, no cmd.exe."""
+
+        if any(char.isspace() for char in executable):
+            raise GoodWinRMError(
+                f"Cannot run {executable!r} natively: the executable must live in a "
+                "space-free path (stage it in a directory without whitespace)"
+            )
+        command_id: str | None = None
+        with self._lock:
+            try:
+                command_id = self.protocol.run_command(
+                    self.shell_id,
+                    executable,
+                    [win_quote(argument) for argument in arguments],
+                    skip_cmd_shell=True,
+                )
+                stdout, stderr, status_code = self.protocol.get_command_output(
+                    self.shell_id, command_id
+                )
+            finally:
+                if command_id is not None:
+                    with suppress(Exception):
+                        self.protocol.cleanup_command(self.shell_id, command_id)
+
+        return CommandResult(
+            stdout=_decode_output(stdout),
+            stderr=_decode_output(stderr),
             status_code=status_code,
         )
 
@@ -434,6 +501,8 @@ def open_remote_shell(args: argparse.Namespace) -> WinRMShell:
         raise GoodWinRMError("Timeouts must be positive")
     if args.read_timeout <= args.operation_timeout:
         raise GoodWinRMError("Read timeout must be greater than operation timeout")
+    if args.keepalive_interval < 0:
+        raise GoodWinRMError("Keepalive interval cannot be negative")
 
     _configure_ccache(args.ccache)
     use_https = args.https or args.transport in {"ssl", "certificate"}
@@ -489,7 +558,7 @@ def upload_file(local_path: str, remote_path: str | None, shell: WinRMShell) -> 
         raise TransferError(f"Local file not found: {local}")
 
     destination = resolve_remote_path(remote_path or local.name, shell.current_directory)
-    temporary = f"{destination}.goodwinrm-{uuid.uuid4().hex}.tmp"
+    temporary = ntpath.join(ntpath.dirname(destination), f".tmp-{uuid.uuid4().hex[:8]}")
     total = local.stat().st_size
     transferred = 0
 
@@ -580,7 +649,7 @@ def download_file(remote_path: str, local_path: str | None, shell: WinRMShell) -
         raise TransferError("Cannot determine remote file size") from exc
 
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.goodwinrm-", dir=target.parent
+        prefix=f".{target.name}.", suffix=".part", dir=target.parent
     )
     temporary = Path(temporary_name)
     transferred = 0
@@ -649,6 +718,276 @@ def list_directory(shell: WinRMShell, pattern: str | None = None) -> str:
     return result.stdout
 
 
+def win_quote(value: str) -> str:
+    quoted = ['"']
+    backslashes = 0
+    for char in value:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == '"':
+            quoted.append("\\" * (backslashes * 2 + 1) + '"')
+        else:
+            quoted.append("\\" * backslashes + char)
+        backslashes = 0
+    quoted.append("\\" * (backslashes * 2) + '"')
+    return "".join(quoted)
+
+
+def resolve_executable(executable: str, current_directory: str) -> str:
+    if ntpath.isabs(executable) or "/" in executable or "\\" in executable:
+        return resolve_remote_path(executable, current_directory)
+    return executable
+
+
+def build_process_command_line(
+    executable: str,
+    arguments: Sequence[str],
+    stdout_path: str | None = None,
+    stderr_path: str | None = None,
+) -> str:
+    command_line = " ".join([win_quote(executable), *(win_quote(arg) for arg in arguments)])
+    if stdout_path is None and stderr_path is None:
+        return command_line
+    command_line = 'cmd /c "' + command_line
+    if stdout_path is not None:
+        command_line += f" > {win_quote(stdout_path)}"
+    if stderr_path is not None:
+        command_line += f" 2> {win_quote(stderr_path)}"
+    return command_line + '"'
+
+
+def build_wmi_spawn_script(command_line: str, current_directory: str) -> str:
+    return (
+        "$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        f"-Arguments @{{CommandLine={ps_quote(command_line)};"
+        f"CurrentDirectory={ps_quote(current_directory)}}};"
+        'if($r.ReturnValue -ne 0){throw "Win32_Process.Create failed: '
+        '$($r.ReturnValue)"};$r.ProcessId'
+    )
+
+
+def build_schtasks_spawn_script(command_line: str, task_name: str) -> str:
+    task_action = command_line.replace('"', '\\"')
+    return (
+        f"$n={ps_quote(task_name)};$a={ps_quote(task_action)};"
+        "schtasks /f /create /ru SYSTEM /rl HIGHEST /tn $n /tr $a /sc once /st 00:00"
+        " 2>$null|Out-Null;"
+        'if($LASTEXITCODE -ne 0){throw "schtasks /create failed: $($LASTEXITCODE)"};'
+        "schtasks /run /tn $n 2>$null|Out-Null;"
+        'if($LASTEXITCODE -ne 0){throw "schtasks /run failed: $($LASTEXITCODE)"};'
+        "Start-Sleep -Seconds 2;$lr=$null;"
+        "try{$s=New-Object -ComObject Schedule.Service;$s.Connect();"
+        "$lr=[int]$s.GetFolder('\\').GetTask($n).LastTaskResult}catch{};"
+        "schtasks /delete /f /tn $n 2>$null|Out-Null;"
+        "if($null -eq $lr){throw 'cannot read scheduled task last result'};"
+        'if($lr -ne 0 -and $lr -ne 267009){throw "scheduled task did not start '
+        '(last result $($lr))"};'
+        'if($LASTEXITCODE -ne 0){throw "schtasks /delete failed: $($LASTEXITCODE)"}'
+    )
+
+
+def parse_spawn_request(tokens: Sequence[str]) -> SpawnRequest:
+    stdout_path: str | None = None
+    stderr_path: str | None = None
+    launcher = "auto"
+    stage_dir: str | None = None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--schtasks":
+            launcher = "schtasks"
+            index += 1
+            continue
+        if token == "--launcher":
+            if index + 1 >= len(tokens) or tokens[index + 1] not in LAUNCHERS:
+                raise GoodWinRMError(SPAWN_USAGE)
+            launcher = tokens[index + 1]
+            index += 2
+            continue
+        if token == "--stage-dir":
+            if index + 1 >= len(tokens):
+                raise GoodWinRMError(SPAWN_USAGE)
+            stage_dir = tokens[index + 1]
+            index += 2
+            continue
+        if token in {"--stdout", "--stderr"}:
+            if index + 1 >= len(tokens):
+                raise GoodWinRMError(SPAWN_USAGE)
+            if token == "--stdout":
+                stdout_path = tokens[index + 1]
+            else:
+                stderr_path = tokens[index + 1]
+            index += 2
+            continue
+        break
+    if index >= len(tokens):
+        raise GoodWinRMError(SPAWN_USAGE)
+    return SpawnRequest(
+        executable=tokens[index],
+        arguments=tuple(tokens[index + 1 :]),
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        use_schtasks=launcher == "schtasks",
+        launcher=launcher,
+        stage_dir=stage_dir,
+    )
+
+
+def execute_foreground(
+    shell: WinRMShell, executable: str, arguments: Sequence[str]
+) -> CommandResult:
+    arguments_script = " ".join(ps_quote(arg) for arg in arguments)
+    if ntpath.isabs(executable) or "/" in executable or "\\" in executable:
+        target = resolve_executable(executable, shell.current_directory)
+        invocation = f"& {ps_quote(target)} {arguments_script}"
+    else:
+        invocation = (
+            f"$e=Resolve-Path -LiteralPath {ps_quote(executable)} -ErrorAction SilentlyContinue;"
+            f"& $(if($e){{$e.Path}}else{{{ps_quote(executable)}}}) {arguments_script}"
+        )
+    return shell.run(
+        f"Set-Location -LiteralPath {ps_quote(shell.current_directory)} -ErrorAction Stop;"
+        f"{invocation};if($null -ne $LASTEXITCODE){{exit $LASTEXITCODE}}else{{exit 1}}"
+    )
+
+
+def spawn_wmi(shell: WinRMShell, request: SpawnRequest) -> int:
+    target = resolve_executable(request.executable, shell.current_directory)
+    command_line = build_process_command_line(
+        target, request.arguments, request.stdout_path, request.stderr_path
+    )
+    result = shell.run(build_wmi_spawn_script(command_line, shell.current_directory))
+    if result.status_code != 0 or result.stderr:
+        detail = result.stderr or result.stdout or f"exit code {result.status_code}"
+        raise GoodWinRMError(f"Cannot spawn {request.executable}: {detail}")
+    try:
+        return int(result.stdout.splitlines()[-1])
+    except (IndexError, ValueError) as exc:
+        raise GoodWinRMError("Cannot determine spawned process id") from exc
+
+
+def spawn_scheduled(shell: WinRMShell, request: SpawnRequest) -> str:
+    target = resolve_executable(request.executable, shell.current_directory)
+    command_line = build_process_command_line(
+        target, request.arguments, request.stdout_path, request.stderr_path
+    )
+    task_name = uuid.uuid4().hex[:12]
+    result = shell.run(build_schtasks_spawn_script(command_line, task_name))
+    if result.status_code != 0:
+        detail = result.stderr or result.stdout or f"exit code {result.status_code}"
+        raise GoodWinRMError(f"Cannot spawn {request.executable}: {detail}")
+    return task_name
+
+
+def parse_helper_output(stdout: str) -> int:
+    for line in reversed(stdout.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("PID "):
+            value = stripped.removeprefix("PID ").strip()
+            if value.isdigit():
+                return int(value)
+            break
+        if stripped.startswith("ERR "):
+            raise GoodWinRMError(f"launcher helper failed with code {stripped[4:].strip()}")
+    raise GoodWinRMError("Cannot determine spawned process id")
+
+
+def _select_helper_blob(shell: WinRMShell) -> str | None:
+    result = shell.run("$env:PROCESSOR_ARCHITECTURE")
+    if result.status_code != 0 or not result.stdout:
+        return None
+    architecture = result.stdout.splitlines()[-1].strip().upper()
+    if architecture == "AMD64":
+        return GWSPAWN_X64_B64
+    if architecture == "X86":
+        return GWSPAWN_X86_B64
+    return None
+
+
+def _stage_helper(blob: str, stage_dir: str, shell: WinRMShell) -> str:
+    remote_helper = ntpath.join(stage_dir, f".{uuid.uuid4().hex[:8]}.exe")
+    descriptor, temporary_name = tempfile.mkstemp(suffix=".exe")
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(base64.b64decode(blob))
+        upload_file(temporary_name, remote_helper, shell)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return remote_helper
+
+
+def _resolve_stage_dir(request: SpawnRequest, shell: WinRMShell) -> str:
+    if request.stage_dir is not None:
+        stage_dir = resolve_remote_path(request.stage_dir, shell.current_directory)
+    else:
+        stage_dir = DEFAULT_STAGE_DIR
+    if any(char.isspace() for char in stage_dir):
+        raise GoodWinRMError(
+            f"Cannot stage the native launcher helper in {stage_dir!r}: the staging "
+            "directory must not contain whitespace"
+        )
+    return stage_dir
+
+
+def spawn_native(shell: WinRMShell, request: SpawnRequest, launcher: str, blob: str | None) -> int:
+    if blob is None:
+        raise GoodWinRMError(
+            f"Cannot spawn {request.executable}: {launcher} helper is unavailable "
+            "for this target architecture"
+        )
+    target = resolve_executable(request.executable, shell.current_directory)
+    helper_remote = _stage_helper(blob, _resolve_stage_dir(request, shell), shell)
+    try:
+        result = shell.run_native(
+            helper_remote, [HELPER_MODES[launcher], target, *request.arguments]
+        )
+        if result.status_code != 0 or result.stderr:
+            detail = result.stderr or result.stdout or f"exit code {result.status_code}"
+            raise GoodWinRMError(f"Cannot spawn {request.executable} via {launcher}: {detail}")
+        return parse_helper_output(result.stdout)
+    finally:
+        with suppress(Exception):
+            shell.run(
+                f"Remove-Item -LiteralPath {ps_quote(helper_remote)} -Force "
+                "-ErrorAction SilentlyContinue"
+            )
+
+
+def launch_spawn(shell: WinRMShell, request: SpawnRequest) -> None:
+    launcher = request.launcher
+    if launcher in HELPER_MODES and (request.stdout_path or request.stderr_path):
+        print_info(f"{launcher} does not support output redirection; using wmi-ps")
+        launcher = "wmi-ps"
+    if launcher == "auto":
+        blob = None if (request.stdout_path or request.stderr_path) else _select_helper_blob(shell)
+        attempts = ["breakaway", "wmi-native", "wmi-ps"] if blob is not None else ["wmi-ps"]
+        failures: list[str] = []
+        for candidate in attempts:
+            try:
+                if candidate in HELPER_MODES:
+                    pid = spawn_native(shell, request, candidate, blob)
+                else:
+                    pid = spawn_wmi(shell, request)
+            except GoodWinRMError as exc:
+                failures.append(f"{candidate}: {exc}")
+                continue
+            print_success(f"Spawned {request.executable} with PID {pid} via {candidate}")
+            return
+        raise GoodWinRMError(f"No spawn launcher succeeded ({'; '.join(failures)})")
+    if launcher == "schtasks":
+        task_name = spawn_scheduled(shell, request)
+        print_success(f"Spawned {request.executable} via scheduled task {task_name}")
+        return
+    if launcher == "wmi-ps":
+        pid = spawn_wmi(shell, request)
+        print_success(f"Spawned {request.executable} with PID {pid} via wmi-ps")
+        return
+    pid = spawn_native(shell, request, launcher, _select_helper_blob(shell))
+    print_success(f"Spawned {request.executable} with PID {pid} via {launcher}")
+
+
 def _builtin_help() -> None:
     print(
         "Commands:\n"
@@ -657,10 +996,68 @@ def _builtin_help() -> None:
         "  ls [PATTERN]             List files\n"
         "  upload LOCAL [REMOTE]    Upload a file\n"
         "  download REMOTE [LOCAL]  Download a file\n"
+        "  runps LOCAL.ps1 [ARGS...]  Run a local PowerShell script remotely\n"
+        "  script | paste           Multi-line mode (paste, end with a line '.')\n"
+        "  run EXE [ARGS...]        Execute a remote binary and report its exit code\n"
+        "  exec EXE [ARGS...]       Alias for run\n"
+        "  spawn [OPTIONS] EXE [ARGS...]\n"
+        "                           Launch a detached process that survives disconnect\n"
+        "    --launcher MODE        auto (default), breakaway, wmi-native, wmi-ps, schtasks\n"
+        "    --stage-dir DIR        Remote directory for the native launcher helper\n"
+        "    --stdout PATH          Redirect spawned stdout to a remote file\n"
+        "    --stderr PATH          Redirect spawned stderr to a remote file\n"
+        "    --schtasks             Alias for --launcher schtasks\n"
+        "    (breakaway/wmi-native do not redirect output; wmi-ps is used instead)\n"
         "  clear | cls              Clear the terminal\n"
         "  exit                     Close the session\n"
         "Any other input is executed as PowerShell in the current directory."
     )
+
+
+SCRIPT_USAGE = "Usage: runps <local .ps1> [arguments...]"
+
+
+def execute_script_block(
+    shell: WinRMShell, script_text: str, arguments: Sequence[str] = ()
+) -> CommandResult:
+    """Run an arbitrary (possibly multi-line) PowerShell script remotely.
+
+    The script is wrapped in a script block so a top-level ``param(...)`` is
+    valid, and it is executed as an encoded command rather than a ``.ps1`` file
+    so a restrictive ExecutionPolicy (e.g. AllSigned) does not block it.
+    """
+
+    invocation = "& {\n" + script_text.rstrip("\n") + "\n}"
+    if arguments:
+        invocation += " " + " ".join(ps_quote(argument) for argument in arguments)
+    return shell.run(invocation)
+
+
+def print_command_result(result: CommandResult) -> None:
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print_error(result.stderr)
+    elif result.status_code != 0:
+        print_error(f"PowerShell exited with code {result.status_code}")
+
+
+def read_multiline_script(session: PromptSession[str]) -> list[str]:
+    print_info("Multi-line mode: paste the script, end with a line containing only '.'")
+    lines: list[str] = []
+    while True:
+        try:
+            line = session.prompt("... ")
+        except KeyboardInterrupt:
+            print()
+            return []
+        except EOFError:
+            print()
+            break
+        if line.strip() == ".":
+            break
+        lines.append(line)
+    return lines
 
 
 def dispatch_command(command: str, shell: WinRMShell) -> bool:
@@ -721,6 +1118,35 @@ def dispatch_command(command: str, shell: WinRMShell) -> bool:
         print_success(f"Downloaded {values[0]} -> {local_destination} ({size} bytes)")
         return True
 
+    if verb in {"runps", "runscript"}:
+        values = split_shell_args(raw_args)
+        if not values:
+            raise GoodWinRMError(SCRIPT_USAGE)
+        try:
+            script_text = Path(values[0]).read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise GoodWinRMError(f"Cannot read {values[0]}: {exc}") from exc
+        print_command_result(execute_script_block(shell, script_text, values[1:]))
+        return True
+    if verb in {"run", "exec"}:
+        values = split_shell_args(raw_args)
+        if not values:
+            raise GoodWinRMError("Usage: run <remote executable> [arguments...]")
+        result = execute_foreground(shell, values[0], values[1:])
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print_error(result.stderr)
+        if result.status_code != 0:
+            print_error(f"{values[0]} exited with code {result.status_code}")
+        return True
+    if verb == "spawn":
+        if not raw_args:
+            raise GoodWinRMError(SPAWN_USAGE)
+        request = parse_spawn_request(split_shell_args(raw_args))
+        launch_spawn(shell, request)
+        return True
+
     result = shell.run(
         f"Set-Location -LiteralPath {ps_quote(shell.current_directory)} "
         f"-ErrorAction Stop;{stripped}"
@@ -753,6 +1179,13 @@ def interactive_loop(shell: WinRMShell, username: str | None, history_enabled: b
         "cd",
         "upload",
         "download",
+        "run",
+        "exec",
+        "runps",
+        "runscript",
+        "script",
+        "paste",
+        "spawn",
         "whoami",
         "hostname",
         "ipconfig",
@@ -775,6 +1208,11 @@ def interactive_loop(shell: WinRMShell, username: str | None, history_enabled: b
                 else f"{shell.identity}@{shell.hostname} {shell.current_directory} > ",
                 completer=completer,
             )
+            if command.strip().lower() in {"script", "paste", "multiline"}:
+                lines = read_multiline_script(session)
+                if lines:
+                    print_command_result(execute_script_block(shell, "\n".join(lines)))
+                continue
             if not dispatch_command(command, shell):
                 return
         except KeyboardInterrupt:
@@ -795,7 +1233,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         shell = open_remote_shell(args)
         print_success(f"Authenticated to {shell.host} as {shell.identity}")
-        shell.start_keepalive()
+        if not args.no_keepalive and args.keepalive_interval > 0:
+            shell.start_keepalive(interval=args.keepalive_interval)
         interactive_loop(shell, args.username, history_enabled=not args.no_history)
     except GoodWinRMError as exc:
         print_error(str(exc))

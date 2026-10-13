@@ -184,7 +184,7 @@ def test_download_is_atomic_on_remote_failure(tmp_path: Path) -> None:
         download_file("remote.bin", str(destination), shell)  # type: ignore[arg-type]
 
     assert destination.read_bytes() == b"keep me"
-    assert not list(tmp_path.glob(".existing.bin.goodwinrm-*"))
+    assert not list(tmp_path.glob(".existing.bin.*"))
 
 
 def test_download_rejects_invalid_base64_and_cleans_temp_file(tmp_path: Path) -> None:
@@ -195,7 +195,7 @@ def test_download_rejects_invalid_base64_and_cleans_temp_file(tmp_path: Path) ->
         download_file("remote.bin", str(destination), shell)  # type: ignore[arg-type]
 
     assert not destination.exists()
-    assert not list(tmp_path.glob(".bad.bin.goodwinrm-*"))
+    assert not list(tmp_path.glob(".bad.bin.*"))
 
 
 def test_download_rejects_missing_remote_file_before_creating_temp(tmp_path: Path) -> None:
@@ -206,7 +206,7 @@ def test_download_rejects_missing_remote_file_before_creating_temp(tmp_path: Pat
         download_file("missing.bin", str(destination), shell)  # type: ignore[arg-type]
 
     assert not destination.exists()
-    assert not list(tmp_path.glob(".missing.bin.goodwinrm-*"))
+    assert not list(tmp_path.glob(".missing.bin.*"))
 
 
 def test_download_rejects_invalid_remote_size(tmp_path: Path) -> None:
@@ -225,7 +225,7 @@ def test_download_rejects_size_mismatch_and_preserves_destination(tmp_path: Path
         download_file("remote.bin", str(destination), shell)  # type: ignore[arg-type]
 
     assert destination.read_bytes() == b"keep me"
-    assert not list(tmp_path.glob(".existing.bin.goodwinrm-*"))
+    assert not list(tmp_path.glob(".existing.bin.*"))
 
 
 def test_download_infers_filename_and_accepts_local_directory(
